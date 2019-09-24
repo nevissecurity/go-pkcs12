@@ -6,6 +6,8 @@ This repository is a fork of the https://github.com/SSLMate/go-pkcs12 upstream r
 
 [![GoDoc](https://godoc.org/software.sslmate.com/src/go-pkcs12?status.svg)](https://godoc.org/software.sslmate.com/src/go-pkcs12)
 
+## Introduction
+
     import "github.com/hetesiistvan/go-pkcs12"
 
 Package pkcs12 implements some of PKCS#12 (also known as P12 or PFX).
