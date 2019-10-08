@@ -25,6 +25,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"io"
+	"reflect"
 )
 
 // DefaultPassword is the string "changeit", a commonly-used password for
@@ -40,6 +41,9 @@ var (
 	oidFriendlyName     = asn1.ObjectIdentifier([]int{1, 2, 840, 113549, 1, 9, 20})
 	oidLocalKeyID       = asn1.ObjectIdentifier([]int{1, 2, 840, 113549, 1, 9, 21})
 	oidMicrosoftCSPName = asn1.ObjectIdentifier([]int{1, 3, 6, 1, 4, 1, 311, 17, 1})
+
+	oidJavaSafebagFlag  = asn1.ObjectIdentifier([]int{2, 16, 840, 1, 113894, 746875, 1, 1})
+	oidExtendedKeyUsage = asn1.ObjectIdentifier([]int{2, 5, 29, 37, 0})
 )
 
 type pfxPdu struct {
@@ -242,8 +246,53 @@ func Decode(pfxData []byte, password string) (privateKey interface{}, certificat
 	return
 }
 
+// DecodeTrustStore extracts CA certificates from pfxData.
+func DecodeTrustStore(pfxData []byte, password string) (certs map[string]*x509.Certificate, err error) {
+	encodedPassword, err := bmpString(password)
+	if err != nil {
+		return nil, err
+	}
+
+	bags, encodedPassword, err := getSafeContents(pfxData, encodedPassword)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(bags) == 0 {
+		err = errors.New("pkcs12: no bag was found in trust store")
+		return nil, err
+	}
+
+	certs = map[string]*x509.Certificate{}
+	for _, bag := range bags {
+		if !bag.Id.Equal(oidCertBag) {
+			err = errors.New("pkcs12: expected only cert bags in trust store")
+			return nil, err
+		}
+
+		bagCertsData, err := decodeCertBag(bag.Value.Bytes)
+		if err != nil {
+			return nil, err
+		}
+
+		bagCert, err := x509.ParseCertificate(bagCertsData)
+		if err != nil {
+			return nil, err
+		}
+
+		friendlyName, err := certBagFriendlyName(bag.Attributes)
+		if err != nil {
+			return nil, err
+		}
+
+		certs[friendlyName] = bagCert
+	}
+
+	return
+}
+
 // DecodeChain extracts a certificate, a CA certificate chain, and private key
-// from pfxData. This function assumes that there is at least one certificate
+// from pfxData. This function checks if there is at least one certificate
 // and only one private key in the pfxData.  The first certificate is assumed to
 // be the leaf certificate, and subsequent certificates, if any, are assumed to
 // comprise the CA certificate chain.
@@ -342,9 +391,9 @@ func getSafeContents(p12Data, password []byte) (bags []safeBag, updatedPassword 
 		return nil, nil, err
 	}
 
-	if len(authenticatedSafe) != 2 {
-		return nil, nil, NotImplementedError("expected exactly two items in the authenticated safe")
-	}
+	// if len(authenticatedSafe) != 2 {
+	// 	return nil, nil, NotImplementedError("expected exactly two items in the authenticated safe")
+	// }
 
 	for _, ci := range authenticatedSafe {
 		var data []byte
@@ -479,6 +528,129 @@ func Encode(rand io.Reader, privateKey interface{}, certificate *x509.Certificat
 		return nil, errors.New("pkcs12: error writing P12 data: " + err.Error())
 	}
 	return
+}
+
+// EncodeTrustStore produces pfxData containing any number of CA certificates
+// (certs).
+//
+// The rand argument is used to provide entropy for the encryption, and
+// can be set to rand.Reader from the crypto/rand package.
+//
+// EncodeTrustStore creates one SafeContent: that contains the certificates,
+// The certificate bag have the LocalKeyId attribute set to the SHA-1 fingerprint of the end-entity
+// certificate.
+func EncodeTrustStore(rand io.Reader, certs map[string]*x509.Certificate, password string) (pfxData []byte, err error) {
+	encodedPassword, err := bmpString(password)
+	if err != nil {
+		return nil, err
+	}
+
+	var pfx pfxPdu
+	pfx.Version = 3
+
+	var certBags []safeBag
+	var certBag *safeBag
+
+	for alias, cert := range certs {
+		var attributes []pkcs12Attribute
+		if attributes, err = certBagAttributes(alias); err != nil {
+			return nil, err
+		}
+		if certBag, err = makeCertBag(cert.Raw, attributes); err != nil {
+			return nil, err
+		}
+		certBags = append(certBags, *certBag)
+	}
+
+	// Construct an authenticated safe with two SafeContents.
+	// The first SafeContents is encrypted and contains the cert bags.
+	// The second SafeContents is unencrypted and contains the shrouded key bag.
+	var authenticatedSafe [1]contentInfo
+	if authenticatedSafe[0], err = makeSafeContents(rand, certBags, encodedPassword); err != nil {
+		return nil, err
+	}
+
+	var authenticatedSafeBytes []byte
+	if authenticatedSafeBytes, err = asn1.Marshal(authenticatedSafe[:]); err != nil {
+		return nil, err
+	}
+
+	// compute the MAC
+	pfx.MacData.Mac.Algorithm.Algorithm = oidSHA1
+	pfx.MacData.MacSalt = make([]byte, 8)
+	if _, err = rand.Read(pfx.MacData.MacSalt); err != nil {
+		return nil, err
+	}
+	pfx.MacData.Iterations = 1
+	if err = computeMac(&pfx.MacData, authenticatedSafeBytes, encodedPassword); err != nil {
+		return nil, err
+	}
+
+	pfx.AuthSafe.ContentType = oidDataContentType
+	pfx.AuthSafe.Content.Class = 2
+	pfx.AuthSafe.Content.Tag = 0
+	pfx.AuthSafe.Content.IsCompound = true
+	if pfx.AuthSafe.Content.Bytes, err = asn1.Marshal(authenticatedSafeBytes); err != nil {
+		return nil, err
+	}
+
+	if pfxData, err = asn1.Marshal(pfx); err != nil {
+		return nil, errors.New("pkcs12: error writing P12 data: " + err.Error())
+	}
+	return
+}
+
+// certBagAttributes returns a list of pkcs12 attributes needed for a cert bag
+// to be recognized as trustedCertEntry by the java keytool.
+//
+// This requires the following attribute to be present:
+// 2.16.840.1.113894.746875.1.1
+// See https://github.com/kaikramer/keystore-explorer/issues/35
+//
+// Additionally an alias is also added to the attribute list.
+func certBagAttributes(alias string) (attributes []pkcs12Attribute, err error) {
+	var aliasBytes []byte
+	if aliasBytes, err = marshalBmpString(alias); err != nil {
+		return nil, err
+	}
+	var extKeyUsageOidBytes []byte
+	if extKeyUsageOidBytes, err = asn1.Marshal(oidExtendedKeyUsage); err != nil {
+		return nil, err
+	}
+
+	attributes = []pkcs12Attribute{
+		// Alias
+		pkcs12Attribute{
+			Id: oidFriendlyName,
+			Value: asn1.RawValue{
+				Class:      0,
+				Tag:        17,
+				IsCompound: true,
+				Bytes:      aliasBytes,
+			},
+		},
+		// Special tag
+		pkcs12Attribute{
+			Id: oidJavaSafebagFlag,
+			Value: asn1.RawValue{
+				Class:      0,
+				Tag:        17,
+				IsCompound: true,
+				Bytes:      extKeyUsageOidBytes,
+			},
+		},
+	}
+	return
+}
+
+func certBagFriendlyName(attributes []pkcs12Attribute) (friendlyName string, err error) {
+	for _, attribute := range attributes {
+		if reflect.DeepEqual(attribute.Id, oidFriendlyName) {
+			friendlyName, err = unmarshalBmpString(attribute.Value.Bytes)
+			return
+		}
+	}
+	return "", errors.New("pkcs12: friendly name not specified for cert bag")
 }
 
 func makeCertBag(certBytes []byte, attributes []pkcs12Attribute) (certBag *safeBag, err error) {
