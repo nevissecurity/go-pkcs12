@@ -13,7 +13,7 @@ import (
 	"encoding/asn1"
 	"errors"
 
-	"github.com/hetesiistvan/go-pkcs12/internal/rc2"
+	"github.com/nevissecurity/go-pkcs12/internal/rc2"
 )
 
 var (
